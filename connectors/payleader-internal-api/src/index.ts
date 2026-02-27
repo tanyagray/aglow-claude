@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+import { createServer } from "http";
+import { exec } from "child_process";
+import { homedir } from "os";
+import { join } from "path";
+import { mkdir, writeFile, readFile, rm } from "fs/promises";
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -9,35 +15,62 @@ import {
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const BASE_URL =
-  (process.env.PAYLEADER_BASE_URL || "https://lab.mypayleadr.com/payleadr-internal-api").replace(/\/$/, "");
+const BASE_URL = (
+  process.env.PAYLEADER_BASE_URL || "https://lab.mypayleadr.com/payleadr-internal-api"
+).replace(/\/$/, "");
 
-let envUsername = process.env.PAYLEADER_USERNAME;
-let envPassword = process.env.PAYLEADER_PASSWORD;
+const CONFIG_DIR = join(homedir(), ".config", "aglow");
+const CREDENTIALS_FILE = join(CONFIG_DIR, "payleader.json");
+
+// ─── Credential Storage ───────────────────────────────────────────────────────
+
+interface StoredCredentials {
+  accessToken: string;
+  refreshToken: string | null;
+  tokenExpiry: number;
+  username: string;
+  savedAt: string;
+}
+
+async function loadCredentials(): Promise<StoredCredentials | null> {
+  try {
+    const content = await readFile(CREDENTIALS_FILE, "utf-8");
+    return JSON.parse(content) as StoredCredentials;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCredentials(creds: StoredCredentials): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true });
+  await writeFile(CREDENTIALS_FILE, JSON.stringify(creds, null, 2), {
+    encoding: "utf-8",
+    mode: 0o600, // owner read/write only
+  });
+}
+
+async function clearCredentials(): Promise<void> {
+  try {
+    await rm(CREDENTIALS_FILE);
+  } catch {
+    // already gone
+  }
+}
 
 // ─── Token State ──────────────────────────────────────────────────────────────
 
 let accessToken: string | null = null;
 let refreshTokenValue: string | null = null;
 let tokenExpiry = 0;
+let loggedInAs: string | null = null;
 
 // ─── Auth Helpers ─────────────────────────────────────────────────────────────
 
-async function login(username?: string, password?: string): Promise<void> {
-  const user = username || envUsername;
-  const pass = password || envPassword;
-
-  if (!user || !pass) {
-    throw new Error(
-      "Credentials required. Set PAYLEADER_USERNAME and PAYLEADER_PASSWORD " +
-        "environment variables, or call payleader_authenticate with username/password."
-    );
-  }
-
+async function login(username: string, password: string): Promise<void> {
   const res = await fetch(`${BASE_URL}/v2/users/authenticated-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ userName: user, password: pass }),
+    body: JSON.stringify({ userName: username, password }),
   });
 
   if (!res.ok) {
@@ -49,12 +82,20 @@ async function login(username?: string, password?: string): Promise<void> {
   accessToken = (data.accessToken ?? data.token ?? data.access_token) as string;
   refreshTokenValue = (data.refreshToken ?? data.refresh_token ?? null) as string | null;
   tokenExpiry = Date.now() + 50 * 60 * 1000; // refresh 10 min before 1 hr expiry
+  loggedInAs = username;
+
+  await saveCredentials({
+    accessToken,
+    refreshToken: refreshTokenValue,
+    tokenExpiry,
+    username,
+    savedAt: new Date().toISOString(),
+  });
 }
 
 async function tryRefresh(): Promise<void> {
   if (!refreshTokenValue) {
-    await login();
-    return;
+    throw new Error("No refresh token. Please run payleader_setup to log in.");
   }
 
   const res = await fetch(`${BASE_URL}/v2/users/refresh`, {
@@ -64,23 +105,338 @@ async function tryRefresh(): Promise<void> {
   });
 
   if (!res.ok) {
-    // Refresh failed — fall back to full login
-    await login();
-    return;
+    // Refresh expired — clear saved creds so user knows they need to re-authenticate
+    await clearCredentials();
+    accessToken = null;
+    refreshTokenValue = null;
+    tokenExpiry = 0;
+    throw new Error(
+      "Session expired. Please run payleader_setup to log in again."
+    );
   }
 
   const data = (await res.json()) as Record<string, unknown>;
   accessToken = (data.accessToken ?? data.token ?? data.access_token) as string;
   refreshTokenValue = (data.refreshToken ?? data.refresh_token ?? null) as string | null;
   tokenExpiry = Date.now() + 50 * 60 * 1000;
+
+  if (loggedInAs) {
+    await saveCredentials({
+      accessToken,
+      refreshToken: refreshTokenValue,
+      tokenExpiry,
+      username: loggedInAs,
+      savedAt: new Date().toISOString(),
+    });
+  }
 }
 
 async function ensureAuth(): Promise<void> {
-  if (!accessToken) {
-    await login();
-  } else if (Date.now() >= tokenExpiry) {
-    await tryRefresh();
+  // Already have a valid token in memory
+  if (accessToken && Date.now() < tokenExpiry) return;
+
+  // Try loading from disk
+  const stored = await loadCredentials();
+  if (stored) {
+    loggedInAs = stored.username;
+
+    if (stored.tokenExpiry > Date.now()) {
+      // Stored token still valid
+      accessToken = stored.accessToken;
+      refreshTokenValue = stored.refreshToken;
+      tokenExpiry = stored.tokenExpiry;
+      return;
+    }
+
+    if (stored.refreshToken) {
+      // Try refreshing with stored refresh token
+      refreshTokenValue = stored.refreshToken;
+      await tryRefresh();
+      return;
+    }
   }
+
+  // Fall back to env vars (for technical / CI usage)
+  const envUser = process.env.PAYLEADER_USERNAME;
+  const envPass = process.env.PAYLEADER_PASSWORD;
+  if (envUser && envPass) {
+    await login(envUser, envPass);
+    return;
+  }
+
+  throw new Error(
+    "Not authenticated. Ask the user to run the payleader_setup tool to log in."
+  );
+}
+
+// ─── Setup Flow (browser-based login) ────────────────────────────────────────
+
+const SETUP_PORT = 47832;
+
+const SETUP_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connect Payleadr to Claude</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f7;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 40px;
+      width: 100%;
+      max-width: 420px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+
+    .logo-icon {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 20px;
+    }
+
+    .logo-text { font-size: 18px; font-weight: 600; color: #111; }
+    .logo-sub  { font-size: 13px; color: #666; }
+
+    h1 { font-size: 22px; font-weight: 700; color: #111; margin-bottom: 8px; }
+    p  { font-size: 14px; color: #555; margin-bottom: 24px; line-height: 1.5; }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: #333;
+      margin-bottom: 6px;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1.5px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 15px;
+      outline: none;
+      transition: border-color 0.15s;
+      margin-bottom: 16px;
+    }
+
+    input:focus { border-color: #6366f1; }
+
+    button {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+
+    button:hover   { opacity: 0.9; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .alert {
+      margin-top: 16px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      display: none;
+    }
+
+    .alert-error   { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+    .alert-success { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
+
+    .success-icon { font-size: 32px; text-align: center; margin-bottom: 12px; }
+
+    .secure-note {
+      margin-top: 20px;
+      font-size: 12px;
+      color: #999;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <div class="logo-icon">⚡</div>
+      <div>
+        <div class="logo-text">Payleadr</div>
+        <div class="logo-sub">Connect to Claude</div>
+      </div>
+    </div>
+
+    <div id="form-view">
+      <h1>Sign in to Payleadr</h1>
+      <p>Enter your Payleadr credentials to connect your account to Claude. Your credentials are used once to obtain a secure token.</p>
+
+      <form id="login-form">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username"
+               placeholder="your@email.com" required autocomplete="username" />
+
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password"
+               placeholder="••••••••" required autocomplete="current-password" />
+
+        <button type="submit" id="submit-btn">Connect to Claude</button>
+      </form>
+
+      <div id="error-alert" class="alert alert-error"></div>
+    </div>
+
+    <div id="success-view" style="display:none; text-align:center;">
+      <div class="success-icon">✅</div>
+      <h1>Connected!</h1>
+      <p style="margin-top:8px;">Your Payleadr account is now linked to Claude. You can close this window and return to Claude.</p>
+    </div>
+
+    <p class="secure-note">🔒 Your password is never stored. Only a secure token is saved locally.</p>
+  </div>
+
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const btn = document.getElementById('submit-btn');
+      const err = document.getElementById('error-alert');
+      btn.disabled = true;
+      btn.textContent = 'Connecting…';
+      err.style.display = 'none';
+
+      try {
+        const res = await fetch('/authenticate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value,
+            password: document.getElementById('password').value,
+          }),
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+          document.getElementById('form-view').style.display = 'none';
+          document.getElementById('success-view').style.display = 'block';
+        } else {
+          err.textContent = data.error || 'Login failed. Please check your credentials.';
+          err.style.display = 'block';
+          btn.disabled = false;
+          btn.textContent = 'Connect to Claude';
+        }
+      } catch {
+        err.textContent = 'Connection error. Please try again.';
+        err.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Connect to Claude';
+      }
+    });
+  </script>
+</body>
+</html>`;
+
+function openBrowser(url: string): void {
+  const cmd =
+    process.platform === "darwin" ? `open "${url}"` :
+    process.platform === "win32"  ? `start "" "${url}"` :
+    `xdg-open "${url}"`;
+  exec(cmd);
+}
+
+async function runSetupFlow(): Promise<{ success: boolean; username?: string; message: string }> {
+  return new Promise((resolve) => {
+    const server = createServer(async (req, res) => {
+      if (req.method === "GET" && req.url === "/") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(SETUP_HTML);
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/authenticate") {
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", async () => {
+          try {
+            const { username, password } = JSON.parse(body) as {
+              username: string;
+              password: string;
+            };
+
+            await login(username, password);
+
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ success: true }));
+
+            // Give the browser a moment to show the success state, then shut down
+            setTimeout(() => {
+              server.close();
+              resolve({ success: true, username, message: `Successfully connected as ${username}.` });
+            }, 1500);
+          } catch (error) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: error instanceof Error ? error.message : String(error) })
+            );
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    server.listen(SETUP_PORT, "127.0.0.1", () => {
+      const url = `http://localhost:${SETUP_PORT}`;
+      openBrowser(url);
+    });
+
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE") {
+        resolve({
+          success: false,
+          message: `Port ${SETUP_PORT} is already in use. Another setup may be running — check your browser for a Payleadr login page.`,
+        });
+      } else {
+        resolve({ success: false, message: `Server error: ${err.message}` });
+      }
+    });
+
+    // 5-minute timeout
+    setTimeout(() => {
+      server.close();
+      resolve({ success: false, message: "Setup timed out after 5 minutes. Please try again." });
+    }, 5 * 60 * 1000);
+  });
 }
 
 // ─── Request Helpers ──────────────────────────────────────────────────────────
@@ -103,7 +459,7 @@ async function api<T>(
 
   const url = `${BASE_URL}${path}${query ? buildQuery(query) : ""}`;
 
-  const makeRequest = async (): Promise<Response> =>
+  const makeRequest = (): Promise<Response> =>
     fetch(url, {
       method,
       headers: {
@@ -115,9 +471,9 @@ async function api<T>(
 
   let res = await makeRequest();
 
-  // Single retry on 401
+  // Single retry on 401 — attempt a refresh first
   if (res.status === 401) {
-    await login();
+    await tryRefresh();
     res = await makeRequest();
   }
 
@@ -133,22 +489,23 @@ async function api<T>(
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
-  // Auth
+  // Setup & Auth
   {
-    name: "payleader_authenticate",
+    name: "payleader_setup",
     description:
-      "Explicitly authenticate with the Payleadr API. This is called automatically on first use if PAYLEADER_USERNAME and PAYLEADER_PASSWORD are set. Use this to provide credentials at runtime or to switch accounts.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        username: { type: "string", description: "Payleadr username (overrides env var)" },
-        password: { type: "string", description: "Payleadr password (overrides env var)" },
-      },
-    },
+      "Opens a browser-based login page to connect your Payleadr account to Claude. " +
+      "Run this once — your session is saved and reused automatically. " +
+      "Use this to log in for the first time, switch accounts, or reconnect after your session expires.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "payleader_whoami",
+    description: "Show the currently logged-in Payleadr account and session status.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "payleader_logout",
-    description: "Log out and revoke the current access token.",
+    description: "Log out of Payleadr and remove the saved session.",
     inputSchema: { type: "object", properties: {} },
   },
 
@@ -176,7 +533,7 @@ const TOOLS = [
       type: "object",
       required: ["username"],
       properties: {
-        username: { type: "string", description: "Username to look up" },
+        username: { type: "string" },
       },
     },
   },
@@ -186,10 +543,10 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        search: { type: "string", description: "Search term" },
-        page: { type: "number", description: "Page number (1-based)" },
-        limit: { type: "number", description: "Results per page" },
-        sortBy: { type: "string", description: "Field to sort by" },
+        search: { type: "string" },
+        page: { type: "number" },
+        limit: { type: "number" },
+        sortBy: { type: "string" },
       },
     },
   },
@@ -216,7 +573,7 @@ const TOOLS = [
         lastName: { type: "string" },
         email: { type: "string" },
         mobile: { type: "string" },
-        dateOfBirth: { type: "string", description: "ISO date string, e.g. 1990-01-15" },
+        dateOfBirth: { type: "string", description: "ISO date, e.g. 1990-01-15" },
         countryCode: { type: "string", description: "Aus or Nzl" },
         address: { type: "string" },
       },
@@ -226,13 +583,11 @@ const TOOLS = [
   // Wallets
   {
     name: "payleader_get_possible_wallet_clients",
-    description: "List potential wallet clients for a given merchant/user.",
+    description: "List potential wallet clients for a merchant.",
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
   {
@@ -242,7 +597,7 @@ const TOOLS = [
       type: "object",
       required: ["legacyUserId"],
       properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
+        legacyUserId: { type: "string" },
         email: { type: "string" },
         mobile: { type: "string" },
         firstName: { type: "string" },
@@ -252,13 +607,11 @@ const TOOLS = [
   },
   {
     name: "payleader_get_wallet_invite",
-    description: "Retrieve details of a wallet invitation by UUID.",
+    description: "Retrieve wallet invitation details by UUID.",
     inputSchema: {
       type: "object",
       required: ["inviteUuid"],
-      properties: {
-        inviteUuid: { type: "string", description: "Wallet invitation UUID" },
-      },
+      properties: { inviteUuid: { type: "string" } },
     },
   },
   {
@@ -267,9 +620,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["walletInvitationId"],
-      properties: {
-        walletInvitationId: { type: "string" },
-      },
+      properties: { walletInvitationId: { type: "string" } },
     },
   },
   {
@@ -280,7 +631,7 @@ const TOOLS = [
       required: ["walletInvitationId", "code"],
       properties: {
         walletInvitationId: { type: "string" },
-        code: { type: "string", description: "Verification code" },
+        code: { type: "string" },
       },
     },
   },
@@ -288,13 +639,13 @@ const TOOLS = [
   // Memberships
   {
     name: "payleader_list_memberships",
-    description: "List memberships for a merchant user, with optional status filter.",
+    description: "List memberships for a merchant, with optional status filter.",
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
       properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
-        status: { type: "string", description: "Filter by membership status" },
+        legacyUserId: { type: "string" },
+        status: { type: "string" },
         page: { type: "number" },
         limit: { type: "number" },
       },
@@ -307,22 +658,11 @@ const TOOLS = [
       type: "object",
       required: ["legacyUserId", "legacyCustomerUserId"],
       properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
-        legacyCustomerUserId: { type: "string", description: "Customer legacy user ID" },
-        treatments: {
-          type: "array",
-          description: "Array of treatment objects",
-          items: { type: "object" },
-        },
-        perks: {
-          type: "array",
-          description: "Array of perk objects",
-          items: { type: "object" },
-        },
-        paymentOption: {
-          type: "string",
-          description: "Payment option enum value",
-        },
+        legacyUserId: { type: "string" },
+        legacyCustomerUserId: { type: "string" },
+        treatments: { type: "array", items: { type: "object" } },
+        perks: { type: "array", items: { type: "object" } },
+        paymentOption: { type: "string" },
         discount: { type: "number" },
         surcharge: { type: "number" },
       },
@@ -349,9 +689,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
   {
@@ -391,9 +729,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
   {
@@ -402,9 +738,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
   {
@@ -413,9 +747,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
   {
@@ -424,9 +756,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
   {
@@ -436,21 +766,19 @@ const TOOLS = [
       type: "object",
       required: ["legacyUserId", "userId"],
       properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
-        userId: { type: "string", description: "Staff user ID to add" },
-        role: { type: "string", description: "Staff role or permissions" },
+        legacyUserId: { type: "string" },
+        userId: { type: "string" },
+        role: { type: "string" },
       },
     },
   },
   {
     name: "payleader_get_merchant_integrations",
-    description: "List external app integrations configured for a merchant.",
+    description: "List external app integrations for a merchant.",
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
 
@@ -462,7 +790,7 @@ const TOOLS = [
       type: "object",
       required: ["legacyUserId", "amount"],
       properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
+        legacyUserId: { type: "string" },
         amount: { type: "number", description: "Amount in cents" },
         description: { type: "string" },
         buyerId: { type: "string" },
@@ -477,20 +805,18 @@ const TOOLS = [
       type: "object",
       required: ["legacyUserId", "legacyBuyerId"],
       properties: {
-        legacyUserId: { type: "string", description: "Merchant legacy user ID" },
-        legacyBuyerId: { type: "string", description: "Buyer legacy user ID" },
+        legacyUserId: { type: "string" },
+        legacyBuyerId: { type: "string" },
       },
     },
   },
   {
     name: "payleader_get_zai_session_token",
-    description: "Obtain a Zai payment gateway session token for a merchant.",
+    description: "Obtain a Zai payment gateway session token.",
     inputSchema: {
       type: "object",
       required: ["legacyUserId"],
-      properties: {
-        legacyUserId: { type: "string" },
-      },
+      properties: { legacyUserId: { type: "string" } },
     },
   },
 
@@ -498,7 +824,8 @@ const TOOLS = [
   {
     name: "payleader_list_audit",
     description:
-      "Query audit logs. Supports filtering by date range, user, and action type (Purchase, Refund, PartialRefund, Void, PayNow, SecondaryAttempt).",
+      "Query audit logs. Supports filtering by date range, user, and action type " +
+      "(Purchase, Refund, PartialRefund, Void, PayNow, SecondaryAttempt).",
     inputSchema: {
       type: "object",
       properties: {
@@ -508,11 +835,7 @@ const TOOLS = [
         startDate: { type: "string", description: "ISO date string" },
         endDate: { type: "string", description: "ISO date string" },
         userId: { type: "string" },
-        actionType: {
-          type: "string",
-          description:
-            "One of: Purchase, Refund, PartialRefund, Void, PayNow, SecondaryAttempt",
-        },
+        actionType: { type: "string" },
       },
     },
   },
@@ -524,22 +847,43 @@ type Input = Record<string, unknown>;
 
 async function handleTool(name: string, input: Input): Promise<unknown> {
   switch (name) {
-    // ── Auth ──────────────────────────────────────────────────────────────────
-    case "payleader_authenticate": {
-      if (input.username) envUsername = input.username as string;
-      if (input.password) envPassword = input.password as string;
-      await login(input.username as string | undefined, input.password as string | undefined);
-      return { success: true, message: "Authenticated successfully" };
+    // ── Setup & Auth ──────────────────────────────────────────────────────────
+    case "payleader_setup": {
+      const result = await runSetupFlow();
+      if (result.success) {
+        return {
+          success: true,
+          message: `${result.message} Your session is saved and will be refreshed automatically.`,
+        };
+      }
+      return { success: false, message: result.message };
+    }
+
+    case "payleader_whoami": {
+      const stored = await loadCredentials();
+      if (!stored) {
+        return { loggedIn: false, message: "Not logged in. Run payleader_setup to connect." };
+      }
+      const isExpired = stored.tokenExpiry < Date.now();
+      return {
+        loggedIn: true,
+        username: stored.username,
+        savedAt: stored.savedAt,
+        sessionStatus: isExpired ? "expired (will auto-refresh)" : "active",
+        expiresAt: new Date(stored.tokenExpiry).toISOString(),
+      };
     }
 
     case "payleader_logout": {
       if (accessToken) {
         await api("POST", "/v2/users/logout", { token: accessToken }).catch(() => null);
-        accessToken = null;
-        refreshTokenValue = null;
-        tokenExpiry = 0;
       }
-      return { success: true, message: "Logged out" };
+      await clearCredentials();
+      accessToken = null;
+      refreshTokenValue = null;
+      tokenExpiry = 0;
+      loggedInAs = null;
+      return { success: true, message: "Logged out and session cleared." };
     }
 
     // ── Users ─────────────────────────────────────────────────────────────────
@@ -550,10 +894,7 @@ async function handleTool(name: string, input: Input): Promise<unknown> {
       return api("GET", `/v2/users/user/${input.userId}`);
 
     case "payleader_get_user_by_username":
-      return api(
-        "GET",
-        `/v2/users/username/${encodeURIComponent(input.username as string)}`
-      );
+      return api("GET", `/v2/users/username/${encodeURIComponent(input.username as string)}`);
 
     case "payleader_search_users":
       return api("GET", "/v2/users/search", undefined, {
@@ -597,10 +938,7 @@ async function handleTool(name: string, input: Input): Promise<unknown> {
       return api("GET", `/v2/wallets/wallet-invites/${input.inviteUuid}`);
 
     case "payleader_send_wallet_verification_code":
-      return api(
-        "POST",
-        `/v2/wallets/${input.walletInvitationId}/send-verification-code`
-      );
+      return api("POST", `/v2/wallets/${input.walletInvitationId}/send-verification-code`);
 
     case "payleader_validate_wallet_verification_code":
       return api(
@@ -612,12 +950,11 @@ async function handleTool(name: string, input: Input): Promise<unknown> {
 
     // ── Memberships ───────────────────────────────────────────────────────────
     case "payleader_list_memberships":
-      return api(
-        "GET",
-        `/v2/memberships/${input.legacyUserId}/memberships`,
-        undefined,
-        { status: input.status, Page: input.page, Limit: input.limit }
-      );
+      return api("GET", `/v2/memberships/${input.legacyUserId}/memberships`, undefined, {
+        status: input.status,
+        Page: input.page,
+        Limit: input.limit,
+      });
 
     case "payleader_create_membership":
       return api(
@@ -636,11 +973,7 @@ async function handleTool(name: string, input: Input): Promise<unknown> {
       return api(
         "PUT",
         `/v2/memberships/${input.legacyUserId}/memberships/${input.membershipId}`,
-        {
-          status: input.status,
-          treatments: input.treatments,
-          perks: input.perks,
-        }
+        { status: input.status, treatments: input.treatments, perks: input.perks }
       );
 
     case "payleader_list_plan_templates":
@@ -719,10 +1052,10 @@ async function handleTool(name: string, input: Input): Promise<unknown> {
   }
 }
 
-// ─── Server Setup ─────────────────────────────────────────────────────────────
+// ─── MCP Server ───────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "payleader-internal-api", version: "1.0.0" },
+  { name: "payleader-internal-api", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
