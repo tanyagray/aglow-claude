@@ -66,6 +66,66 @@ let loggedInAs: string | null = null;
 
 // ─── Auth Helpers ─────────────────────────────────────────────────────────────
 
+/**
+ * Robustly extract an access token from an API response object.
+ * Checks known field names first, then scans all string values (including one
+ * level of nesting) for anything that looks like a JWT (starts with "eyJ").
+ */
+function extractAccessToken(data: Record<string, unknown>): string {
+  // Check well-known field names
+  const knownKeys = ["accessToken", "token", "access_token", "jwt", "jwtToken", "bearerToken", "authToken", "id_token"];
+  for (const key of knownKeys) {
+    const val = data[key];
+    if (typeof val === "string" && val.length > 0) return val;
+  }
+
+  // Scan top-level string values for JWT pattern (base64url header "eyJ...")
+  for (const val of Object.values(data)) {
+    if (typeof val === "string" && val.startsWith("eyJ") && val.includes(".")) return val;
+  }
+
+  // One level deep — handle wrapped responses like { data: { token: "..." } }
+  for (const val of Object.values(data)) {
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const nested = val as Record<string, unknown>;
+      for (const key of knownKeys) {
+        const nval = nested[key];
+        if (typeof nval === "string" && nval.length > 0) return nval;
+      }
+      for (const nval of Object.values(nested)) {
+        if (typeof nval === "string" && nval.startsWith("eyJ") && nval.includes(".")) return nval;
+      }
+    }
+  }
+
+  throw new Error(
+    `Login succeeded but no access token found in API response. ` +
+    `Response keys: ${Object.keys(data).join(", ")}`
+  );
+}
+
+/**
+ * Extract a refresh token from an API response, or return null if absent.
+ */
+function extractRefreshToken(data: Record<string, unknown>): string | null {
+  const knownKeys = ["refreshToken", "refresh_token", "RefreshToken"];
+  for (const key of knownKeys) {
+    const val = data[key];
+    if (typeof val === "string" && val.length > 0) return val;
+  }
+  // One level deep
+  for (const val of Object.values(data)) {
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      const nested = val as Record<string, unknown>;
+      for (const key of knownKeys) {
+        const nval = nested[key];
+        if (typeof nval === "string" && nval.length > 0) return nval;
+      }
+    }
+  }
+  return null;
+}
+
 async function login(username: string, password: string): Promise<void> {
   const res = await fetch(`${BASE_URL}/v2/users/authenticated-user`, {
     method: "POST",
@@ -79,8 +139,8 @@ async function login(username: string, password: string): Promise<void> {
   }
 
   const data = (await res.json()) as Record<string, unknown>;
-  accessToken = (data.accessToken ?? data.token ?? data.access_token) as string;
-  refreshTokenValue = (data.refreshToken ?? data.refresh_token ?? null) as string | null;
+  accessToken = extractAccessToken(data);  // throws if not found
+  refreshTokenValue = extractRefreshToken(data);
   tokenExpiry = Date.now() + 50 * 60 * 1000; // refresh 10 min before 1 hr expiry
   loggedInAs = username;
 
@@ -116,16 +176,22 @@ async function tryRefresh(): Promise<void> {
   }
 
   const data = (await res.json()) as Record<string, unknown>;
-  accessToken = (data.accessToken ?? data.token ?? data.access_token) as string;
-  refreshTokenValue = (data.refreshToken ?? data.refresh_token ?? null) as string | null;
+  accessToken = extractAccessToken(data);
+  // Only rotate the refresh token if the endpoint actually returns a new one;
+  // otherwise preserve the existing one so subsequent refreshes still work.
+  const newRefresh = extractRefreshToken(data);
+  if (newRefresh) refreshTokenValue = newRefresh;
   tokenExpiry = Date.now() + 50 * 60 * 1000;
 
-  if (loggedInAs) {
+  // loggedInAs may be null if the server restarted and loaded creds from disk —
+  // fall back to the username stored in the file so we always persist the update.
+  const saveUsername = loggedInAs ?? (await loadCredentials())?.username;
+  if (saveUsername) {
     await saveCredentials({
       accessToken,
       refreshToken: refreshTokenValue,
       tokenExpiry,
-      username: loggedInAs,
+      username: saveUsername,
       savedAt: new Date().toISOString(),
     });
   }
