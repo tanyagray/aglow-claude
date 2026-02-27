@@ -1,0 +1,12 @@
+{
+  "name": "aglow",
+  "owner": {
+    "name": "Tanya Gray",
+    "email": "tanya@aglow.ai"
+  },
+  "metadata": {
+    "description": "Aglow Claude Code plugin marketplace",
+    "version": "1.0.0"
+  },
+  "plugins": []
+}
