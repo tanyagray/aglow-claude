@@ -1,0 +1,10 @@
+{
+  "name": "payleader-internal-api",
+  "version": "1.0.0",
+  "description": "MCP connector for authenticating and querying the Payleadr Internal API. Covers users, wallets, memberships, merchants, payments, and audit reports.",
+  "author": {
+    "name": "Tanya Gray"
+  },
+  "keywords": ["payleadr", "payments", "memberships", "api"],
+  "mcpServers": "./.mcp.json"
+}

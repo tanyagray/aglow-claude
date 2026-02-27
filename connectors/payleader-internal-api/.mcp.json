@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "payleader-internal-api": {
+      "command": "npx",
+      "args": ["--yes", "tsx", "${CLAUDE_PLUGIN_ROOT}/src/index.ts"],
+      "env": {
+        "PAYLEADER_BASE_URL": "${PAYLEADER_BASE_URL}",
+        "PAYLEADER_USERNAME": "${PAYLEADER_USERNAME}",
+        "PAYLEADER_PASSWORD": "${PAYLEADER_PASSWORD}"
+      }
+    }
+  }
+}
